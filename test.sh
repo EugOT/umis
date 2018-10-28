@@ -95,6 +95,13 @@ umis demultiplex_samples --nedit 1 \
 --out_dir tests/results \
 examples/Klein-inDrop/test14.fq
 
+umis fastqtransform \
+examples/10XGenomics_v2/transform.json \
+examples/10XGenomics_v2/test_7_R1.fastq \
+examples/10XGenomics_v2/test_7_R2.fastq \
+examples/10XGenomics_v2/test_7_I1.fastq \
+> tests/results/test15.fq
+
 umis bamtag \
 examples/bamtag/bamtag.sam \
 > tests/results/test_bamtag.sam
@@ -160,7 +167,8 @@ umis cb_filter \
 umis fasttagcount \
      --cb_cutoff 1 \
      --cb_histogram examples/tagcount/cb-histogram.txt.gz \
-     examples/tagcount/tagcount.sam \
+     --umi_matrix tests/results/test22-fasttagcount-umi-matrix.txt \
+     examples/tagcount/tagcount.bam \
     tests/results/test22-fasttagcount-cbhistogram.txt
 
 umis tagcount \
@@ -174,7 +182,7 @@ umis fasttagcount \
      --genemap examples/tagcount/gene-map.tsv \
      --cb_cutoff 1 \
      --cb_histogram examples/tagcount/cb-histogram.txt.gz \
-     examples/tagcount/tagcount.sam \
+     examples/tagcount/tagcount.bam \
     tests/results/test24-fasttagcount-cbhistogram-genemap.txt
 
 # only display diff output if there are differences

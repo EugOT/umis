@@ -18,13 +18,13 @@ from functools import partial
 import toolz as tz
 
 from .barcodes import (exact_barcode_filter, correcting_barcode_filter,
-                      exact_sample_filter, correcting_sample_filter, exact_sample_filter2
-                      , correcting_sample_filter2, umi_filter, append_uids, MutationHash)
+                       exact_sample_filter, correcting_sample_filter, exact_sample_filter2,
+                       correcting_sample_filter2, umi_filter, append_uids, MutationHash)
 import numpy as np
 import scipy.io, scipy.sparse
 import click
 
-VERSION = "0.9.0b"
+VERSION = "1.0.1"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,6 +33,9 @@ BarcodeInfo = collections.namedtuple("BarcodeInfo", ["bamtag", "readprefix"])
 BARCODEINFO = {"sample": BarcodeInfo(bamtag="XS", readprefix="SAMPLE"),
                "cellular": BarcodeInfo(bamtag="XC", readprefix="CELL"),
                "molecular": BarcodeInfo(bamtag="RX", readprefix="UMI")}
+
+def open_gzipsafe(f):
+    return gzip.open(f) if f.endswith(".gz") else open(f)
 
 def safe_makedir(dname):
     """Make a directory if it doesn't exist, handling concurrent race conditions.
@@ -69,7 +72,9 @@ def read_fastq(filename):
     """
     if not filename:
         return itertools.cycle((None,))
-    if filename.endswith('gz'):
+    if filename == "-":
+        filename_fh = sys.stdin
+    elif filename.endswith('gz'):
         filename_fh = BufferedReader(gzip.open(filename, mode='rt'))
     else:
         filename_fh = open(filename)
@@ -692,7 +697,6 @@ def tagcount(sam, out, genemap, output_evidence_table, positional, minevidence,
 @click.option('--cb_cutoff', default=None,
                 help=("Number of counts to filter cellular barcodes. Set to "
                       "'auto' to calculate a cutoff automatically."))
-@click.option('--no_scale_evidence', default=False, is_flag=True)
 @click.option('--subsample', required=False, default=None, type=int)
 @click.option('--parse_tags', required=False, is_flag=True,
                 help=('Parse BAM tags in stead of read name. In this mode '
@@ -703,8 +707,10 @@ def tagcount(sam, out, genemap, output_evidence_table, positional, minevidence,
                       'read gene mapping information in stead of the mapping '
                       'target nane. Useful if e.g. reads have been mapped to '
                       'genome in stead of transcriptome.'))
+@click.option('--umi_matrix', required=False, 
+              help=('Save a sparse matrix of counts without UMI deduping to this file.'))
 def fasttagcount(sam, out, genemap, positional, minevidence, cb_histogram, 
-                 cb_cutoff, no_scale_evidence, subsample, parse_tags, gene_tags):
+                 cb_cutoff, subsample, parse_tags, gene_tags, umi_matrix):
     ''' Count up evidence for tagged molecules, this implementation assumes the
     alignment file is coordinate sorted
     '''
@@ -714,6 +720,11 @@ def fasttagcount(sam, out, genemap, positional, minevidence, cb_histogram,
     import pandas as pd
 
     from utils import weigh_evidence
+
+    if sam.endswith(".sam"):
+        logger.error("To use the fasttagcount subcommand, the alignment file must be a "
+                     "coordinate sorted, indexed BAM file.")
+        sys.exit(1)
 
     logger.info('Reading optional files')
 
@@ -789,7 +800,8 @@ def fasttagcount(sam, out, genemap, positional, minevidence, cb_histogram,
         sampling_time = time.time() - start_sampling
         logger.info('Sampling done - {:.3}s'.format(sampling_time))
 
-    evidence = collections.defaultdict(lambda: collections.defaultdict(int))
+    evidence = collections.defaultdict(lambda: collections.defaultdict(float))
+    bare_evidence = collections.defaultdict(float)
     logger.info('Tallying evidence')
     start_tally = time.time()
 
@@ -816,6 +828,10 @@ def fasttagcount(sam, out, genemap, positional, minevidence, cb_histogram,
     genes_processed = 0
     cells = list(cb_hist.index)
     targets_seen = set()
+
+    if umi_matrix:
+        bare_evidence_handle = open(umi_matrix, "w")
+        bare_evidence_handle.write(",".join(["gene"] + cells) + "\n")
 
     with open(out, "w") as out_handle:
         out_handle.write(",".join(["gene"] + cells) + "\n")
@@ -874,10 +890,8 @@ def fasttagcount(sam, out, genemap, positional, minevidence, cb_histogram,
                     targets_seen.add(target_name)
 
                     # Scale evidence by number of hits
-                    if no_scale_evidence:
-                        evidence[CB][MB] += 1.0
-                    else:
-                        evidence[CB][MB] += weigh_evidence(aln.tags)
+                    evidence[CB][MB] += weigh_evidence(aln.tags)
+                    bare_evidence[CB] += weigh_evidence(aln.tags)
                     kept += 1
                 transcripts_processed += 1
                 if not transcripts_processed % 1000:
@@ -890,8 +904,18 @@ def fasttagcount(sam, out, genemap, positional, minevidence, cb_histogram,
                 umis = [1 for _, v in evidence[cell].items() if v >= minevidence]
                 earray.append(str(sum(umis)))
             out_handle.write(",".join([gene] + earray) + "\n")
+            earray = []
+            if umi_matrix:
+                for cell in cells:
+                    earray.append(str(int(bare_evidence[cell])))
+                bare_evidence_handle.write(",".join([gene] + earray) + "\n")
+
             evidence = collections.defaultdict(lambda: collections.defaultdict(int))
+            bare_evidence = collections.defaultdict(int)
             genes_processed += 1
+
+    if umi_matrix:
+        bare_evidence_handle.close()
 
     # fill dataframe with missing values, sort and output
     df = pd.read_csv(out, index_col=0, header=0)
@@ -900,6 +924,13 @@ def fasttagcount(sam, out, genemap, positional, minevidence, cb_histogram,
     df = df.reindex(targets.index.values, fill_value=0)
     df = df.sort_index()
     df.to_csv(out)
+
+    if umi_matrix:
+        df = pd.read_csv(umi_matrix, index_col=0, header=0)
+        df = df.reindex(targets.index.values, fill_value=0)
+        df = df.sort_index()
+        df.to_csv(umi_matrix)
+
 
 @click.command()
 @click.argument("csv")
@@ -1009,9 +1040,9 @@ def guess_depth_cutoff(cb_histogram):
 
 @click.command()
 @click.argument('fastq', required=True)
-@click.option('--bc1', type=click.File('r'))
-@click.option('--bc2', type=click.File('r'), required=False)
-@click.option('--bc3', type=click.File('r'), required=False)
+@click.option('--bc1', default=None, required=True)
+@click.option('--bc2', default=None)
+@click.option('--bc3', default=None)
 @click.option('--cores', default=1)
 @click.option('--nedit', default=0)
 def cb_filter(fastq, bc1, bc2, bc3, cores, nedit):
@@ -1019,11 +1050,14 @@ def cb_filter(fastq, bc1, bc2, bc3, cores, nedit):
     Expects formatted fastq files.
     '''
 
-    bc1 = set(cb.strip() for cb in bc1)
+    with open_gzipsafe(bc1) as bc1_fh:
+        bc1 = set(cb.strip() for cb in bc1_fh)
     if bc2:
-        bc2 = set(cb.strip() for cb in bc2)
+        with open_gzipsafe(bc2) as bc2_fh:
+            bc2 = set(cb.strip() for cb in bc2_fh)
     if bc3:
-        bc3 = set(cb.strip() for cb in bc3)
+        with open_gzipsafe(bc3) as bc3_fh:
+            bc3 = set(cb.strip() for cb in bc3_fh)
 
     if nedit == 0:
         filter_cb = partial(exact_barcode_filter, bc1=bc1, bc2=bc2, bc3=bc3)
@@ -1047,7 +1081,7 @@ def cb_filter(fastq, bc1, bc2, bc3, cores, nedit):
                 sys.stdout.write(read)
 
 @click.command()
-@click.argument('fastq', type=click.File('r'))
+@click.argument('fastq', required=True)
 @click.option('--bc', type=click.File('r'))
 @click.option('--cores', default=1)
 @click.option('--nedit', default=0)
@@ -1063,7 +1097,7 @@ def sb_filter(fastq, bc, cores, nedit):
         filter_sb = partial(correcting_sample_filter2, barcodehash=barcodehash)
     p = multiprocessing.Pool(cores)
 
-    chunks = tz.partition_all(10000, stream_fastq(fastq))
+    chunks = tz.partition_all(10000, read_fastq(fastq))
     bigchunks = tz.partition_all(cores, chunks)
     for bigchunk in bigchunks:
         for chunk in p.map(filter_sb, list(bigchunk)):
@@ -1071,7 +1105,7 @@ def sb_filter(fastq, bc, cores, nedit):
                 sys.stdout.write(read)
 
 @click.command()
-@click.argument('fastq', type=click.File('r'))
+@click.argument('fastq', required=True)
 @click.option('--cores', default=1)
 def mb_filter(fastq, cores):
     ''' Filters umis with non-ACGT bases
@@ -1080,7 +1114,7 @@ def mb_filter(fastq, cores):
     filter_mb = partial(umi_filter)
     p = multiprocessing.Pool(cores)
 
-    chunks = tz.partition_all(10000, stream_fastq(fastq))
+    chunks = tz.partition_all(10000, read_fastq(fastq))
     bigchunks = tz.partition_all(cores, chunks)
     for bigchunk in bigchunks:
         for chunk in p.map(filter_mb, list(bigchunk)):
@@ -1088,7 +1122,7 @@ def mb_filter(fastq, cores):
                 sys.stdout.write(read)
 
 @click.command()
-@click.argument('fastq', type=click.File('r'))
+@click.argument('fastq', required=True)
 @click.option('--cores', default=1)
 def add_uid(fastq, cores):
     ''' Adds UID:[samplebc cellbc umi] to readname for umi-tools deduplication
@@ -1098,7 +1132,7 @@ def add_uid(fastq, cores):
     uids = partial(append_uids)
     p = multiprocessing.Pool(cores)
 
-    chunks = tz.partition_all(10000, stream_fastq(fastq))
+    chunks = tz.partition_all(10000, read_fastq(fastq))
     bigchunks = tz.partition_all(cores, chunks)
     for bigchunk in bigchunks:
         for chunk in p.map(uids, list(bigchunk)):
@@ -1308,13 +1342,13 @@ umis.add_command(sparse)
 umis.add_command(fastqtransform)
 umis.add_command(tagcount)
 umis.add_command(fasttagcount)
-umis.add_command(cb_histogram)
-umis.add_command(umi_histogram)
-umis.add_command(cb_filter)
-umis.add_command(sb_filter)
-umis.add_command(mb_filter)
-umis.add_command(add_uid)
+umis.add_command(cb_histogram, name="cb_histogram")
+umis.add_command(umi_histogram, name="umi_histogram")
+umis.add_command(cb_filter, name="cb_filter")
+umis.add_command(sb_filter, name="sb_filter")
+umis.add_command(mb_filter, name="mb_filter")
+umis.add_command(add_uid, name="add_uid")
 umis.add_command(kallisto)
 umis.add_command(bamtag)
-umis.add_command(demultiplex_samples)
-umis.add_command(subset_bamfile)
+umis.add_command(demultiplex_samples, name="demultiplex_samples")
+umis.add_command(subset_bamfile, name="subset_bamfile")
